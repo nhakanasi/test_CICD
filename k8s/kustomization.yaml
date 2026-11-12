@@ -8,14 +8,14 @@ resources:
 # The model to serve. Kustomize appends a content hash to the ConfigMap
 # name, so changing MODEL changes the Deployment and triggers a rollout.
 configMapGenerator:
-- name: llm-config
-  literals:
+- literals:
   - MODEL=qwen2.5:0.5b
+  name: llm-config
+# CI rewrites the chat-ui tag on every push that changes app/.
 images:
+- name: chat-ui
+  newName: ghcr.io/nhakanasi/test_cicd
+  newTag: 6942daf368221570f64e809ed14ebd6228c2ee97
 - name: ollama
   newName: ollama/ollama
   newTag: 0.40.15
-# CI rewrites the chat-ui tag on every push that changes app/.
-- name: chat-ui
-  newName: ghcr.io/nhakanasi/test_cicd
-  newTag: latest
