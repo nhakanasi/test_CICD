@@ -9,4 +9,4 @@ resources:
 images:
 - name: hello-web
   newName: ghcr.io/nhakanasi/test_cicd
-  newTag: 5f13e6f34b097f0b72750eb2a9e78617222271ab
+  newTag: 3d2fd56267448f51d8773aa8e1a09b7342efb629
