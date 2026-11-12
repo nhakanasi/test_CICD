@@ -1,8 +1,26 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
+  # Control plane only (kind taints it in multi-node clusters).
   - role: control-plane
     extraPortMappings:
-      # hello-web NodePort -> http://localhost:8080
+      # chat-ui NodePort -> http://localhost:8080
       - containerPort: 30080
         hostPort: 8080
+  # Pretend GPU node: labeled for nodeSelector, and tainted so only pods
+  # that tolerate "dedicated=llm" (the LLM server) can run here.
+  - role: worker
+    labels:
+      accelerator: fake-gpu
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          taints:
+            - key: dedicated
+              value: llm
+              effect: NoSchedule
+  # General node: chat UI, Argo CD, everything else.
+  - role: worker
+    labels:
+      workload: general

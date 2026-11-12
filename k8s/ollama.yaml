@@ -1,0 +1,113 @@
+# Model cache. Weights live here, not in the image, so a model change
+# never needs an image rebuild and a pod restart does not re-download.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  # GPU-style rollout: there is no spare accelerator to start a new pod
+  # first, so stop the old pod, then start the new one (brief downtime).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      # Run only on the (fake) GPU node, and tolerate the taint that keeps
+      # every other workload off it.
+      nodeSelector:
+        accelerator: fake-gpu
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: llm
+          effect: NoSchedule
+      initContainers:
+        # Download the model named in the llm-config ConfigMap before the
+        # server starts. Layers already in the cache are skipped.
+        - name: pull-model
+          image: ollama
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ollama serve >/dev/null 2>&1 &
+              until ollama list >/dev/null 2>&1; do sleep 1; done
+              ollama pull "$MODEL"
+          envFrom:
+            - configMapRef:
+                name: llm-config
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      containers:
+        - name: ollama
+          image: ollama
+          env:
+            - name: OLLAMA_KEEP_ALIVE
+              value: "-1"   # keep the model in memory after first use
+          ports:
+            - name: http
+              containerPort: 11434
+          # Large models take minutes to load: allow up to 5 minutes before
+          # the liveness and readiness checks start counting.
+          startupProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 3Gi
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+spec:
+  selector:
+    app: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http

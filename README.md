@@ -1,68 +1,97 @@
-# hello-web: Kubernetes + Argo CD GitOps demo
+# LLM hosting on Kubernetes + Argo CD (GitOps demo)
 
-A static HTML page served by nginx, deployed to a local Kubernetes cluster by Argo CD.
+Serves a small open model (`qwen2.5:0.5b` via [Ollama](https://ollama.com)) on a local
+3-node kind cluster, with a browser chat UI, deployed entirely by Argo CD from this repo.
+It runs on CPU, so it needs no GPU, but it is set up the way GPU serving is: a dedicated,
+tainted "GPU" node, model weights kept outside the image, slow-start probes, and
+no-surge rollouts.
 
-## How the pipeline works
+## Architecture
 
 ```
-edit app/index.html ─► git push ─► GitHub Actions
-                                    ├─ build image, push ghcr.io/<owner>/<repo>:<sha>
-                                    └─ commit new tag into k8s/kustomization.yaml
-                                                   │
-Argo CD (in cluster) polls repo ◄───────────────────┘
-   └─ sees new tag ─► syncs Deployment ─► new pods roll out
+browser ─► localhost:8080 ─► chat-ui (nginx, 2 pods, general node)
+                               ├─ /        static chat page
+                               └─ /api/*, /v1/*  streamed proxy ─► Service ollama:11434
+                                                            ─► ollama pod (fake-gpu node)
+                                                                 └─ PVC: model weights
+
+Git (k8s/) ─► Argo CD ─► cluster
 ```
+
+| Node | Label | Taint | Runs |
+|------|-------|-------|------|
+| `argocd-demo-control-plane` | | control-plane | Kubernetes itself |
+| `argocd-demo-worker` | `accelerator=fake-gpu` | `dedicated=llm:NoSchedule` | ollama only |
+| `argocd-demo-worker2` | `workload=general` | | chat-ui, Argo CD |
+
+## Repository layout
 
 | Path | Purpose |
 |------|---------|
-| `app/` | `index.html` + `Dockerfile` (nginx:alpine) |
-| `k8s/` | Namespace, Deployment, NodePort Service, Kustomization (image tag lives here) |
-| `argocd/application.yaml` | Argo CD Application: watches `k8s/` on `main`, auto-sync + self-heal + prune |
-| `.github/workflows/ci.yaml` | Build, push, bump tag |
-| `scripts/` | Create/delete a local kind cluster with Argo CD |
+| `app/` | Chat UI: `index.html`, `nginx.conf` (streaming proxy to Ollama), `Dockerfile`. Built by CI. |
+| `k8s/ollama.yaml` | PVC for weights, Ollama Deployment (init container pulls the model), ClusterIP Service |
+| `k8s/chat-ui.yaml` | Chat UI Deployment and NodePort Service (30080) |
+| `k8s/kustomization.yaml` | **Model name** (`MODEL=`), Ollama version, chat-ui image tag |
+| `argocd/application.yaml` | Argo CD app `llm-host`: watches `k8s/`, auto-sync, self-heal, prune |
+| `.github/workflows/ci.yaml` | On `app/` changes: build chat-ui image, push to GHCR, bump tag in `k8s/` |
+| `scripts/` | Create and delete the kind cluster with Argo CD |
 
-## Prerequisites
+## Two kinds of deploy
 
-- Docker Desktop (running)
-- [kind](https://kind.sigs.k8s.io/), kubectl
-- A GitHub account
+| You change | Who acts | Result |
+|------------|----------|--------|
+| `app/*` (UI code) | CI builds an image and commits the new tag, then Argo CD syncs | chat-ui pods roll over with no downtime |
+| `MODEL=` in `k8s/kustomization.yaml` | Argo CD only, no image build | The ConfigMap name hash changes, the ollama pod restarts and its init container pulls the new model |
+| `newTag` of `ollama` | Argo CD only | Ollama server upgraded; the cached model is reused |
 
-On Windows: `winget install Docker.DockerDesktop Kubernetes.kind Kubernetes.kubectl`, then run the scripts from Git Bash.
+The model is configuration, not code: switching models never rebuilds an image.
 
 ## Setup
 
-1. **Create a public GitHub repo** and push this folder to `main`.
+Prerequisites: Docker Desktop (running), kind, kubectl, Git Bash on Windows.
 
-2. **Replace placeholders** `OWNER/REPO` (lowercase) in:
-   - `k8s/kustomization.yaml` → `newName: ghcr.io/<owner>/<repo>`
-   - `argocd/application.yaml` → `repoURL: https://github.com/<owner>/<repo>.git`
+```bash
+bash scripts/teardown.sh   # if an older cluster exists
+bash scripts/setup.sh
+```
 
-   Commit and push. The first push touching `app/` (or a manual run via *Actions → build-and-deploy → Run workflow*) builds the image.
+The first start downloads the Ollama image and the model (~400MB). Watch it:
 
-3. **Make the image public**: GitHub → your profile → *Packages* → the package → *Package settings* → *Change visibility → Public*. (Otherwise the cluster cannot pull it. Alternative: create an `imagePullSecret`.)
+```bash
+kubectl -n llm get pods -o wide -w
+```
 
-4. **Start cluster + Argo CD**:
-   ```bash
-   bash scripts/setup.sh
-   ```
-   It prints the Argo CD admin password.
+The ollama pod goes `Init:0/1` (pulling the model), then `Running 0/1` (starting; the
+startup probe allows up to 5 minutes), then `1/1`.
 
-5. **Open**:
-   - App: http://localhost:8080
-   - Argo CD UI: `kubectl -n argocd port-forward svc/argocd-server 8443:443` → https://localhost:8443 (user `admin`)
+- Chat UI: http://localhost:8080
+- Argo CD UI: `kubectl -n argocd port-forward svc/argocd-server 8443:443`, then https://localhost:8443 (user `admin`; `setup.sh` prints the password)
 
-## Test the automation
+The chat-ui image on GHCR must be public (GitHub, Packages, `test_cicd`, Package settings).
 
-1. Edit `app/index.html`, change `Version: v1` to `Version: v2`.
-2. `git commit -am "v2" && git push`
-3. Watch the Actions run finish; it commits `deploy: hello-web <sha>`.
-4. Argo CD polls every ~3 minutes (or click *Refresh* in the UI). Pods roll out; reload http://localhost:8080.
+## API
 
-Self-heal check: `kubectl -n hello-web scale deploy/hello-web --replicas=5`. Argo CD reverts it to 2.
+The UI proxies the Ollama API, so you can call it directly:
 
-## Rollback
+```bash
+curl http://localhost:8080/api/tags
+curl -N http://localhost:8080/api/chat -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Hi"}]}'
+```
 
-`git revert` the `deploy: ...` commit and push. Argo CD syncs back to the previous image.
+`-N` shows tokens as they stream in. Ollama also serves an OpenAI-compatible API at `/v1/chat/completions`.
+
+## Experiments
+
+1. **Scheduling**: `kubectl get pods -A -o wide`. Ollama is on `worker` only; nothing else is.
+   Remove the toleration from `k8s/ollama.yaml` and push: the pod stays `Pending`.
+2. **Model upgrade via GitOps**: set `MODEL=qwen2.5:1.5b`, commit, and push. Watch the old pod
+   stop before the new one starts (`maxSurge: 0`), the init container pull the new model, and
+   both models appear in the UI's model list (the cache keeps the old one).
+3. **Out of memory**: lower the ollama memory limit to `512Mi`; the pod gets `OOMKilled` when the model loads.
+4. **Self-heal**: `kubectl -n llm delete deploy ollama`. Argo CD recreates it; the model is still cached on the PVC, so startup is fast.
+5. **Latency**: the UI shows time to first token and tokens per second. Send several prompts
+   from different tabs at once and watch latency rise: one server, requests queue.
+6. **Streaming**: set `proxy_buffering on;` in `app/nginx.conf` and push. Replies now appear all at once instead of token by token.
 
 ## Cleanup
 
