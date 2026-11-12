@@ -2,6 +2,7 @@
 # Creates a local kind cluster, installs Argo CD, and registers the app.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/env.sh
 
 kind create cluster --name argocd-demo --config scripts/kind-config.yaml
 
